@@ -81,7 +81,6 @@ bstr = { version = "1.12.0", default-features = false }
 document-features = { version = "0.2.0", optional = true }
 
 [dev-dependencies]
-criterion = "0.8.2"
 gix-hash = { path = "../gix-hash", features = ["sha1", "sha256"] }
 gix-testtools = { path = "../tests/tools", default-features = false, features = ["sha1", "sha256"] }
 gix-index = { path = "../gix-index" }
@@ -95,6 +94,7 @@ gix-traverse = { path = "../gix-traverse" }
 
 insta = "1.46.3"
 pretty_assertions = "1.4.0"
+criterion = { version = "6.0.0", package = "codspeed-criterion-compat" }
 
 [package.metadata.docs.rs]
 all-features = true

@@ -1,0 +1,75 @@
+name: codspeed
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  # `workflow_dispatch` allows CodSpeed to trigger backtest
+  # performance analysis in order to generate initial data.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CLICOLOR: "1"
+
+jobs:
+  benchmarks:
+    name: Run benchmarks (${{ matrix.shard }})
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The benchmarks are sharded by crate to keep the wall-clock time of the workflow low.
+          # CodSpeed merges the results of all shards into a single report.
+          - shard: gix-pack
+            packages: -p gix-pack
+          - shard: gix-diff
+            packages: -p gix-diff
+          - shard: gix-note
+            packages: -p gix-note
+          - shard: gix-merge
+            packages: -p gix-merge
+          - shard: gix-index-worktree
+            packages: -p gix-index -p gix-worktree
+          - shard: misc
+            packages: -p gix-attributes -p gix-config -p gix-glob -p gix-object -p gix-utils
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write # For OpenID Connect authentication with CodSpeed.
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup update stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: codspeed-${{ matrix.shard }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: cargo-codspeed@4.6.0
+      - name: Build the benchmark targets
+        env:
+          PACKAGES: ${{ matrix.packages }}
+        run: cargo codspeed build -m simulation $PACKAGES
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@78102a468f96d8e0ccb92d0ec49425753fc42062 # v5.6.0
+        env:
+          PACKAGES: ${{ matrix.packages }}
+        with:
+          mode: simulation
+          run: cargo codspeed run -m simulation $PACKAGES
