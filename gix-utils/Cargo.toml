@@ -68,7 +68,7 @@ getrandom = "0.4"
 gix-testtools = { path = "../tests/tools", default-features = false, features = ["sha1"] }
 insta = "1.46.3"
 gix-utils = { path = ".", features = ["bstr" ]}
-criterion = "0.8.2"
+criterion = { version = "6.0.0", package = "codspeed-criterion-compat" }
 
 [[test]]
 name = "pipe"

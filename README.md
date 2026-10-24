@@ -1,5 +1,6 @@
 [![CI](https://github.com/GitoxideLabs/gitoxide/workflows/ci/badge.svg)](https://github.com/GitoxideLabs/gitoxide/actions)
 [![Crates.io](https://img.shields.io/crates/v/gitoxide.svg)](https://crates.io/crates/gitoxide)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/vikram-experiments/gitoxide?utm_source=badge)
 <img src="etc/msrv-badge.svg">
 
 `gitoxide` is an implementation of `git` written in Rust for developing future-proof applications which strive for correctness and

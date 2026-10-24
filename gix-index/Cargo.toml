@@ -65,7 +65,6 @@ rustix = { version = "1.1.2", default-features = false, features = [
 libc = { version = "0.2.186" }
 
 [dev-dependencies]
-criterion = "0.8.2"
 gix-testtools = { path = "../tests/tools", default-features = false, features = ["sha1", "sha256"] }
 gix-hash = { path = "../gix-hash", features = ["sha1", "sha256"] }
 gix-hashtable = { path = "../gix-hashtable" }
@@ -73,6 +72,7 @@ gix-odb = { path = "../gix-odb" }
 gix-object = { path = "../gix-object" }
 filetime = "0.2.29"
 insta = { version = "1.46.3", features = ["filters"] }
+criterion = { version = "6.0.0", package = "codspeed-criterion-compat" }
 
 [package.metadata.docs.rs]
 features = ["sha1", "document-features", "serde"]
