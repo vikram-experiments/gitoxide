@@ -41,6 +41,7 @@ pub struct State {
     root_tree_id: ObjectId,
     root: InternalNode,
     non_notes: Vec<TreeEntry>,
+    tree_buffers: Vec<Vec<u8>>,
     dirty: bool,
 }
 
@@ -49,6 +50,7 @@ impl State {
     pub fn new(root_tree_id: ObjectId, objects: &impl Find) -> Result<Self> {
         let mut root = InternalNode::default();
         let mut non_notes = Vec::new();
+        let mut tree_buffers = Vec::new();
         load_subtree(
             Subtree {
                 prefix: ObjectId::null(root_tree_id.kind()),
@@ -59,12 +61,14 @@ impl State {
             &mut root,
             0,
             objects,
+            &mut tree_buffers,
             &mut non_notes,
         )?;
         Ok(State {
             root_tree_id,
             root,
             non_notes,
+            tree_buffers,
             dirty: false,
         })
     }
@@ -90,7 +94,15 @@ impl State {
     /// are ignored.
     pub fn get(&mut self, annotated_object_id: &oid, objects: &impl Find) -> Result<Option<ObjectId>> {
         validate_annotated_hash_kind(self.root_tree_id.kind(), annotated_object_id)?;
-        self.reset_on_error(|state| state.root.get(annotated_object_id, 0, objects, &mut state.non_notes))
+        self.reset_on_error(|state| {
+            state.root.get(
+                annotated_object_id,
+                0,
+                objects,
+                &mut state.tree_buffers,
+                &mut state.non_notes,
+            )
+        })
     }
 
     /// Associate `note_blob_id` with `annotated_object_id`, replacing any existing note.
@@ -154,9 +166,13 @@ impl State {
             validate_annotated_hash_kind(self.root_tree_id.kind(), &annotated_object_id)?;
         }
         self.reset_on_error(|state| {
-            let previous_note_blob_id = state
-                .root
-                .remove(&annotated_object_id, 0, objects, &mut state.non_notes)?;
+            let previous_note_blob_id = state.root.remove(
+                &annotated_object_id,
+                0,
+                objects,
+                &mut state.tree_buffers,
+                &mut state.non_notes,
+            )?;
             if let Some(note_blob_id) = note_blob_id {
                 state.root.insert(
                     Node::Note(Note {
@@ -165,6 +181,7 @@ impl State {
                     }),
                     0,
                     objects,
+                    &mut state.tree_buffers,
                     &mut state.non_notes,
                 )?;
             }
@@ -184,9 +201,12 @@ impl State {
             return Ok(self.root_tree_id);
         }
         self.reset_on_error(|state| {
-            state.root_tree_id = state
-                .root
-                .write(&mut state.non_notes, state.root_tree_id.kind(), objects)?;
+            state.root_tree_id = state.root.write(
+                &mut state.non_notes,
+                state.root_tree_id.kind(),
+                objects,
+                &mut state.tree_buffers,
+            )?;
             state.dirty = false;
             Ok(state.root_tree_id)
         })
@@ -300,10 +320,11 @@ impl InternalNode {
         annotated_object_id: &oid,
         nibble: usize,
         objects: &impl Find,
+        tree_buffers: &mut Vec<Vec<u8>>,
         non_notes: &mut Vec<TreeEntry>,
     ) -> Result<Option<ObjectId>> {
-        if self.load_matching_subtree(annotated_object_id, nibble, objects, non_notes)? {
-            return self.get(annotated_object_id, nibble, objects, non_notes);
+        if self.load_matching_subtree(annotated_object_id, nibble, objects, tree_buffers, non_notes)? {
+            return self.get(annotated_object_id, nibble, objects, tree_buffers, non_notes);
         }
 
         let index = nibble_at(annotated_object_id, nibble);
@@ -314,23 +335,42 @@ impl InternalNode {
             let Node::Subtree(subtree) = *self.children[index].take().expect("the matching subtree is present") else {
                 unreachable!("the matching node was checked to be a subtree")
             };
-            load_subtree(subtree, self, nibble, objects, non_notes)?;
-            return self.get(annotated_object_id, nibble, objects, non_notes);
+            load_subtree(subtree, self, nibble, objects, tree_buffers, non_notes)?;
+            return self.get(annotated_object_id, nibble, objects, tree_buffers, non_notes);
         }
 
         match self.children[index].as_deref_mut() {
-            Some(Node::Internal(child)) => child.get(annotated_object_id, nibble + 1, objects, non_notes),
+            Some(Node::Internal(child)) => child.get(annotated_object_id, nibble + 1, objects, tree_buffers, non_notes),
             Some(Node::Note(note)) if note.annotated_object_id == annotated_object_id => Ok(Some(note.note_blob_id)),
             _ => Ok(None),
         }
     }
 
-    fn insert(&mut self, entry: Node, nibble: usize, objects: &impl Find, non_notes: &mut Vec<TreeEntry>) -> Result {
-        if self.load_matching_subtree(entry.key(), nibble, objects, non_notes)? {
-            return self.insert(entry, nibble, objects, non_notes);
+    fn insert(
+        &mut self,
+        entry: Node,
+        nibble: usize,
+        objects: &impl Find,
+        tree_buffers: &mut Vec<Vec<u8>>,
+        non_notes: &mut Vec<TreeEntry>,
+    ) -> Result {
+        let index = nibble_at(entry.key(), nibble);
+        self.insert_at(entry, nibble, index, objects, tree_buffers, non_notes)
+    }
+
+    fn insert_at(
+        &mut self,
+        entry: Node,
+        nibble: usize,
+        index: usize,
+        objects: &impl Find,
+        tree_buffers: &mut Vec<Vec<u8>>,
+        non_notes: &mut Vec<TreeEntry>,
+    ) -> Result {
+        if self.load_matching_subtree(entry.key(), nibble, objects, tree_buffers, non_notes)? {
+            return self.insert_at(entry, nibble, index, objects, tree_buffers, non_notes);
         }
 
-        let index = nibble_at(entry.key(), nibble);
         let Some(existing) = self.children[index].take() else {
             self.children[index] = Some(Box::new(entry));
             return Ok(());
@@ -338,7 +378,7 @@ impl InternalNode {
 
         match *existing {
             Node::Internal(mut child) => {
-                let result = child.insert(entry, nibble + 1, objects, non_notes);
+                let result = child.insert(entry, nibble + 1, objects, tree_buffers, non_notes);
                 self.children[index] = Some(Box::new(Node::Internal(child)));
                 result
             }
@@ -350,16 +390,24 @@ impl InternalNode {
                     && subtree.contains(&note.annotated_object_id)
                 {
                     self.children[index] = Some(Box::new(Node::Note(note)));
-                    return load_subtree(subtree.clone(), self, nibble, objects, non_notes);
+                    return load_subtree(subtree.clone(), self, nibble, objects, tree_buffers, non_notes);
                 }
-                self.insert_collision(Node::Note(note), entry, index, nibble, objects, non_notes)
+                self.insert_collision(Node::Note(note), entry, index, nibble, objects, tree_buffers, non_notes)
             }
             Node::Subtree(subtree) => {
                 if subtree.contains(entry.key()) {
-                    load_subtree(subtree, self, nibble, objects, non_notes)?;
-                    self.insert(entry, nibble, objects, non_notes)
+                    load_subtree(subtree, self, nibble, objects, tree_buffers, non_notes)?;
+                    self.insert(entry, nibble, objects, tree_buffers, non_notes)
                 } else {
-                    self.insert_collision(Node::Subtree(subtree), entry, index, nibble, objects, non_notes)
+                    self.insert_collision(
+                        Node::Subtree(subtree),
+                        entry,
+                        index,
+                        nibble,
+                        objects,
+                        tree_buffers,
+                        non_notes,
+                    )
                 }
             }
         }
@@ -372,11 +420,12 @@ impl InternalNode {
         index: usize,
         nibble: usize,
         objects: &impl Find,
+        tree_buffers: &mut Vec<Vec<u8>>,
         non_notes: &mut Vec<TreeEntry>,
     ) -> Result {
         let mut child = InternalNode::default();
-        child.insert(existing, nibble + 1, objects, non_notes)?;
-        child.insert(entry, nibble + 1, objects, non_notes)?;
+        child.insert(existing, nibble + 1, objects, tree_buffers, non_notes)?;
+        child.insert(entry, nibble + 1, objects, tree_buffers, non_notes)?;
         self.children[index] = Some(Box::new(Node::Internal(child)));
         Ok(())
     }
@@ -386,10 +435,11 @@ impl InternalNode {
         annotated_object_id: &oid,
         nibble: usize,
         objects: &impl Find,
+        tree_buffers: &mut Vec<Vec<u8>>,
         non_notes: &mut Vec<TreeEntry>,
     ) -> Result<Option<ObjectId>> {
-        if self.load_matching_subtree(annotated_object_id, nibble, objects, non_notes)? {
-            return self.remove(annotated_object_id, nibble, objects, non_notes);
+        if self.load_matching_subtree(annotated_object_id, nibble, objects, tree_buffers, non_notes)? {
+            return self.remove(annotated_object_id, nibble, objects, tree_buffers, non_notes);
         }
 
         let index = nibble_at(annotated_object_id, nibble);
@@ -398,7 +448,7 @@ impl InternalNode {
         };
         match *existing {
             Node::Internal(mut child) => {
-                let previous = child.remove(annotated_object_id, nibble + 1, objects, non_notes)?;
+                let previous = child.remove(annotated_object_id, nibble + 1, objects, tree_buffers, non_notes)?;
                 self.children[index] = if previous.is_some() {
                     child.after_removal()
                 } else {
@@ -412,8 +462,8 @@ impl InternalNode {
                 Ok(None)
             }
             Node::Subtree(subtree) if subtree.contains(annotated_object_id) => {
-                load_subtree(subtree, self, nibble, objects, non_notes)?;
-                self.remove(annotated_object_id, nibble, objects, non_notes)
+                load_subtree(subtree, self, nibble, objects, tree_buffers, non_notes)?;
+                self.remove(annotated_object_id, nibble, objects, tree_buffers, non_notes)
             }
             Node::Subtree(subtree) => {
                 self.children[index] = Some(Box::new(Node::Subtree(subtree)));
@@ -427,6 +477,7 @@ impl InternalNode {
         key: &oid,
         nibble: usize,
         objects: &impl Find,
+        tree_buffers: &mut Vec<Vec<u8>>,
         non_notes: &mut Vec<TreeEntry>,
     ) -> Result<bool> {
         let is_match = self.children[0]
@@ -438,7 +489,7 @@ impl InternalNode {
         let Node::Subtree(subtree) = *self.children[0].take().expect("the matching subtree is present") else {
             unreachable!("the matching node was checked to be a subtree")
         };
-        load_subtree(subtree, self, nibble, objects, non_notes)?;
+        load_subtree(subtree, self, nibble, objects, tree_buffers, non_notes)?;
         Ok(true)
     }
 
@@ -471,64 +522,114 @@ fn load_subtree(
     node: &mut InternalNode,
     nibble: usize,
     objects: &impl Find,
+    tree_buffers: &mut Vec<Vec<u8>>,
     non_notes: &mut Vec<TreeEntry>,
 ) -> Result {
-    let mut buf = Vec::new();
-    let tree = objects
-        .find_tree(&subtree.tree_id, &mut buf)
-        .or_raise(|| message!("Could not load notes tree {}", subtree.tree_id))?;
-    let hex_len = subtree.tree_id.kind().len_in_hex();
-    let prefix_hex_len = subtree.prefix_len * 2;
-    let mut prefix_hex = gix_hash::Kind::hex_buf();
-    prefix_hex.fill(b'0');
-    let _ = subtree.prefix.hex_to_buf(&mut prefix_hex);
-    for entry in tree.entries {
-        if entry.mode.is_blob() && entry.filename.len() + prefix_hex_len == hex_len {
-            let mut hex = prefix_hex;
-            hex[prefix_hex_len..hex_len].copy_from_slice(entry.filename);
-            if let Ok(annotated_object_id) = ObjectId::from_hex(&hex[..hex_len]) {
-                node.insert(
-                    Node::Note(Note {
-                        annotated_object_id,
-                        note_blob_id: entry.oid.to_owned(),
+    // Tree entries borrow this buffer, so recursive loads need a separate buffer until this tree is consumed.
+    let mut buf = tree_buffers.pop().unwrap_or_default();
+    let result = (|| {
+        let tree = objects
+            .find_tree(&subtree.tree_id, &mut buf)
+            .or_raise(|| message!("Could not load notes tree {}", subtree.tree_id))?;
+        non_notes.reserve(tree.entries.len());
+        let hash_len = subtree.tree_id.kind().len_in_bytes();
+        let prefix_hex_len = subtree.prefix_len * 2;
+        for entry in tree.entries {
+            if entry.mode.is_blob() && entry.filename.len() + prefix_hex_len == hash_len * 2 {
+                let mut annotated_object_id = subtree.prefix;
+                if decode_hex(
+                    entry.filename,
+                    &mut annotated_object_id.as_mut_slice()[subtree.prefix_len..],
+                )
+                .is_some()
+                {
+                    let index = entry_nibble(&subtree.prefix, subtree.prefix_len, entry.filename, nibble);
+                    node.insert_at(
+                        Node::Note(Note {
+                            annotated_object_id,
+                            note_blob_id: entry.oid.to_owned(),
+                        }),
+                        nibble,
+                        index,
+                        objects,
+                        tree_buffers,
+                        non_notes,
+                    )?;
+                    continue;
+                }
+            }
+            if entry.mode.is_tree()
+                && entry.filename.len() == 2
+                && prefix_hex_len + 2 < hash_len * 2
+                && entry.filename.iter().all(u8::is_ascii_hexdigit)
+            {
+                let path = path_with_component(subtree.path.as_bstr(), entry.filename);
+                let mut prefix = subtree.prefix;
+                let prefix_byte = &mut prefix.as_mut_slice()[subtree.prefix_len..subtree.prefix_len + 1];
+                decode_hex(entry.filename, prefix_byte).expect("validated hex decodes into one byte");
+                let index = entry_nibble(&subtree.prefix, subtree.prefix_len, entry.filename, nibble);
+                node.insert_at(
+                    Node::Subtree(Subtree {
+                        prefix,
+                        prefix_len: subtree.prefix_len + 1,
+                        path,
+                        tree_id: entry.oid.to_owned(),
                     }),
                     nibble,
+                    index,
                     objects,
+                    tree_buffers,
                     non_notes,
                 )?;
-                continue;
+            } else {
+                let path = path_with_component(subtree.path.as_bstr(), entry.filename);
+                non_notes.push(TreeEntry {
+                    path,
+                    mode: entry.mode,
+                    object_id: entry.oid.to_owned(),
+                });
             }
         }
-        if entry.mode.is_tree()
-            && entry.filename.len() == 2
-            && prefix_hex_len + 2 < hex_len
-            && entry.filename.iter().all(u8::is_ascii_hexdigit)
-        {
-            let path = path_with_component(subtree.path.as_bstr(), entry.filename);
-            let mut hex = prefix_hex;
-            hex[prefix_hex_len..prefix_hex_len + 2].copy_from_slice(entry.filename);
-            let prefix = ObjectId::from_hex(&hex[..hex_len]).expect("validated hex produces an object ID");
-            node.insert(
-                Node::Subtree(Subtree {
-                    prefix,
-                    prefix_len: subtree.prefix_len + 1,
-                    path,
-                    tree_id: entry.oid.to_owned(),
-                }),
-                nibble,
-                objects,
-                non_notes,
-            )?;
-        } else {
-            let path = path_with_component(subtree.path.as_bstr(), entry.filename);
-            non_notes.push(TreeEntry {
-                path,
-                mode: entry.mode,
-                object_id: entry.oid.to_owned(),
-            });
-        }
+        Ok(())
+    })();
+    tree_buffers.push(buf);
+    result
+}
+
+fn decode_hex(input: &[u8], output: &mut [u8]) -> Option<()> {
+    if input.len() != output.len() * 2 {
+        return None;
     }
-    Ok(())
+    for (byte, pair) in output.iter_mut().zip(input.chunks_exact(2)) {
+        let Some(high) = hex_value(pair[0]) else {
+            return None;
+        };
+        let Some(low) = hex_value(pair[1]) else {
+            return None;
+        };
+        *byte = high << 4 | low;
+    }
+    Some(())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn entry_nibble(prefix: &oid, prefix_len: usize, filename: &BStr, nibble: usize) -> usize {
+    let prefix_nibble_len = prefix_len * 2;
+    if nibble < prefix_nibble_len {
+        nibble_at(prefix, nibble)
+    } else {
+        filename
+            .get(nibble - prefix_nibble_len)
+            .map_or(0, |byte| usize::from(hex_value(*byte).expect("validated hex entry")))
+    }
 }
 
 impl InternalNode {
@@ -537,9 +638,10 @@ impl InternalNode {
         non_notes: &mut Vec<TreeEntry>,
         hash: gix_hash::Kind,
         objects: &(impl Find + Write),
+        tree_buffers: &mut Vec<Vec<u8>>,
     ) -> Result<ObjectId> {
         let mut notes = Vec::new();
-        self.collect_for_write(0, 0, objects, non_notes, &mut notes)?;
+        self.collect_for_write(0, 0, objects, tree_buffers, non_notes, &mut notes)?;
         if non_notes.is_empty() {
             return write_note_entries(&notes, 0, objects);
         }
@@ -569,6 +671,7 @@ impl InternalNode {
         nibble: usize,
         fanout: usize,
         objects: &impl Find,
+        tree_buffers: &mut Vec<Vec<u8>>,
         non_notes: &mut Vec<TreeEntry>,
         notes: &mut Vec<TreeEntry>,
     ) -> Result {
@@ -588,7 +691,7 @@ impl InternalNode {
             while let Some(entry) = self.children[index].take() {
                 match *entry {
                     Node::Internal(mut child) => {
-                        child.collect_for_write(nibble + 1, fanout, objects, non_notes, notes)?;
+                        child.collect_for_write(nibble + 1, fanout, objects, tree_buffers, non_notes, notes)?;
                         self.children[index] = Some(Box::new(Node::Internal(child)));
                         break;
                     }
@@ -611,7 +714,7 @@ impl InternalNode {
                         break;
                     }
                     Node::Subtree(subtree) => {
-                        load_subtree(subtree, self, nibble, objects, non_notes)?;
+                        load_subtree(subtree, self, nibble, objects, tree_buffers, non_notes)?;
                     }
                 }
             }
