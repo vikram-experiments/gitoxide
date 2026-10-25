@@ -6,7 +6,6 @@
 //! Once such a case becomes a bug and is reproduced in testing, the debug-assertion will kick in and hopefully
 //! contribute to finding a fix faster.
 use gix_error::Result;
-use std::collections::HashMap;
 
 use bstr::{BStr, BString, ByteSlice, ByteVec};
 use gix_diff::tree_with_rewrites::{Change, ChangeRef};
@@ -461,16 +460,19 @@ impl PossibleConflict {
     }
 }
 
-/// The flat list of all tree-nodes so we can avoid having a linked-tree using pointers
+/// The flat lists of all tree-nodes and their sorted child edges, avoiding a linked-tree using pointers
 /// which is useful for traversal and initial setup as that can then trivially be non-recursive.
-pub struct TreeNodes(Vec<TreeNode>);
+pub struct TreeNodes {
+    nodes: Vec<TreeNode>,
+    edges: Vec<TreeEdge>,
+    free_edges: Vec<usize>,
+}
 
 /// Trees lead to other trees, or leafs (without children), and it can be represented by a renamed directory.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 struct TreeNode {
-    /// A mapping of path components to their children to quickly see if `theirs` in some way is potentially
-    /// conflicting with `ours`.
-    children: HashMap<BString, usize>,
+    /// Head of this node's sorted child-edge chain in `TreeNodes::edges`.
+    first_child: Option<usize>,
     /// The index to a change, which is always set if this is a leaf node (with no children), and if there are children and this
     /// is a rewritten tree.
     change_idx: Option<usize>,
@@ -478,6 +480,14 @@ struct TreeNode {
     change_is_tree: bool,
     /// Keep track of where the location of this node is derived from.
     location: ChangeLocation,
+}
+
+/// A path component and its child node, stored in the shared flat edge array.
+#[derive(Debug)]
+struct TreeEdge {
+    component: BString,
+    child_idx: usize,
+    next_sibling: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -491,13 +501,92 @@ enum ChangeLocation {
 
 impl TreeNode {
     fn is_leaf_node(&self) -> bool {
-        self.children.is_empty()
+        self.first_child.is_none()
     }
 }
 
 impl TreeNodes {
     pub fn new() -> Self {
-        TreeNodes(vec![TreeNode::default()])
+        TreeNodes {
+            nodes: vec![TreeNode::default()],
+            edges: Vec::new(),
+            free_edges: Vec::new(),
+        }
+    }
+
+    /// Return a child node or insert a sorted edge to a newly allocated node index.
+    fn child_or_insert(&mut self, parent_idx: usize, component: &BStr) -> (usize, bool) {
+        let mut previous: Option<usize> = None;
+        let mut next = self.nodes[parent_idx].first_child;
+        while let Some(edge_idx) = next {
+            let edge = &self.edges[edge_idx];
+            match edge.component.as_bstr().cmp(component) {
+                std::cmp::Ordering::Equal => return (edge.child_idx, false),
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Less => {
+                    previous = Some(edge_idx);
+                    next = edge.next_sibling;
+                }
+            }
+        }
+
+        let child_idx = self.nodes.len();
+        let new_edge = TreeEdge {
+            component: component.to_owned(),
+            child_idx,
+            next_sibling: next,
+        };
+        let edge_idx = if let Some(edge_idx) = self.free_edges.pop() {
+            self.edges[edge_idx] = new_edge;
+            edge_idx
+        } else {
+            self.edges.push(new_edge);
+            self.edges.len() - 1
+        };
+        if let Some(previous) = previous {
+            self.edges[previous].next_sibling = Some(edge_idx);
+        } else {
+            self.nodes[parent_idx].first_child = Some(edge_idx);
+        }
+        (child_idx, true)
+    }
+
+    fn child(&self, parent_idx: usize, component: &BStr) -> Option<usize> {
+        let mut edge_idx = self.nodes[parent_idx].first_child;
+        while let Some(idx) = edge_idx {
+            let edge = &self.edges[idx];
+            match edge.component.as_bstr().cmp(component) {
+                std::cmp::Ordering::Equal => return Some(edge.child_idx),
+                std::cmp::Ordering::Greater => return None,
+                std::cmp::Ordering::Less => edge_idx = edge.next_sibling,
+            }
+        }
+        None
+    }
+
+    fn remove_child(&mut self, parent_idx: usize, component: &BStr) {
+        let mut previous: Option<usize> = None;
+        let mut next = self.nodes[parent_idx].first_child;
+        while let Some(edge_idx) = next {
+            let edge = &self.edges[edge_idx];
+            match edge.component.as_bstr().cmp(component) {
+                std::cmp::Ordering::Equal => {
+                    let next_sibling = edge.next_sibling;
+                    if let Some(previous) = previous {
+                        self.edges[previous].next_sibling = next_sibling;
+                    } else {
+                        self.nodes[parent_idx].first_child = next_sibling;
+                    }
+                    self.free_edges.push(edge_idx);
+                    return;
+                }
+                std::cmp::Ordering::Greater => return,
+                std::cmp::Ordering::Less => {
+                    previous = Some(edge_idx);
+                    next = edge.next_sibling;
+                }
+            }
+        }
     }
 
     /// Insert our `change` at `change_idx`, into a linked-tree, assuring that each `change` is non-conflicting
@@ -515,36 +604,29 @@ impl TreeNodes {
         .flatten()
         {
             let mut components = to_components(path).peekable();
-            let mut next_index = self.0.len();
-            let mut cursor = &mut self.0[0];
+            let mut cursor_idx = 0;
             while let Some(component) = components.next() {
                 let is_last = components.peek().is_none();
-                match cursor.children.get(component).copied() {
-                    None => {
-                        let new_node = TreeNode {
-                            children: Default::default(),
-                            change_idx: is_last.then_some(change_idx),
-                            change_is_tree: is_last && change.entry_mode().is_tree(),
-                            location: location_hint,
-                        };
-                        cursor.children.insert(component.to_owned(), next_index);
-                        self.0.push(new_node);
-                        cursor = &mut self.0[next_index];
-                        next_index += 1;
-                    }
-                    Some(index) => {
-                        cursor = &mut self.0[index];
-                        if is_last {
-                            // NOTE: we might encounter the same path multiple times in rare conditions.
-                            //       Prefer a non-tree change as it describes the actual leaf collision.
-                            if (cursor.change_idx.is_none() && !cursor.is_leaf_node())
-                                || (cursor.change_is_tree && !change.entry_mode().is_tree())
-                            {
-                                cursor.change_idx = Some(change_idx);
-                                cursor.change_is_tree = change.entry_mode().is_tree();
-                                cursor.location = location_hint;
-                            }
-                        }
+                let (child_idx, is_new) = self.child_or_insert(cursor_idx, component);
+                if is_new {
+                    self.nodes.push(TreeNode {
+                        first_child: None,
+                        change_idx: is_last.then_some(change_idx),
+                        change_is_tree: is_last && change.entry_mode().is_tree(),
+                        location: location_hint,
+                    });
+                }
+                cursor_idx = child_idx;
+                if !is_new && is_last {
+                    let cursor = &mut self.nodes[cursor_idx];
+                    // NOTE: we might encounter the same path multiple times in rare conditions.
+                    //       Prefer a non-tree change as it describes the actual leaf collision.
+                    if (cursor.change_idx.is_none() && !cursor.is_leaf_node())
+                        || (cursor.change_is_tree && !change.entry_mode().is_tree())
+                    {
+                        cursor.change_idx = Some(change_idx);
+                        cursor.change_is_tree = change.entry_mode().is_tree();
+                        cursor.location = location_hint;
                     }
                 }
             }
@@ -556,18 +638,18 @@ impl TreeNodes {
     /// Return the kind of exact-path or tree/non-tree overlap found, including passage through
     /// a rewritten directory, or `None` if the path does not interact with our indexed changes.
     pub fn check_conflict(&self, theirs_location: &BStr) -> Option<PossibleConflict> {
-        if self.0[0].children.is_empty() {
+        if self.nodes[0].first_child.is_none() {
             return None;
         }
         let components = to_components(theirs_location);
-        let mut cursor = &self.0[0];
         let mut cursor_idx = 0;
         let mut intermediate_change = None;
         for component in components {
+            let cursor = &self.nodes[cursor_idx];
             if cursor.change_idx.is_some() {
                 intermediate_change = cursor.change_idx.map(|change_idx| (change_idx, cursor_idx));
             }
-            match cursor.children.get(component).copied() {
+            match self.child(cursor_idx, component) {
                 // *their* change is outside *our* tree
                 None => {
                     let res = if cursor.is_leaf_node() && !cursor.change_is_tree {
@@ -577,7 +659,7 @@ impl TreeNodes {
                     } else {
                         // a change somewhere else, i.e. `a/c` and we know `a/b` only.
                         intermediate_change.and_then(|(change, cursor_idx)| {
-                            let cursor = &self.0[cursor_idx];
+                            let cursor = &self.nodes[cursor_idx];
                             // If this is a destination location of a rename, then the `their_location`
                             // is already at the right spot, and we can just ignore it.
                             if matches!(cursor.location, ChangeLocation::CurrentLocation) {
@@ -591,11 +673,11 @@ impl TreeNodes {
                 }
                 Some(child_idx) => {
                     cursor_idx = child_idx;
-                    cursor = &self.0[cursor_idx];
                 }
             }
         }
 
+        let cursor = &self.nodes[cursor_idx];
         if cursor.is_leaf_node() {
             PossibleConflict::Match {
                 change_idx: cursor.change_idx.expect("leaf nodes always have a change"),
@@ -621,7 +703,7 @@ impl TreeNodes {
         let mut cursor_idx = 0;
         let mut ancestry = Vec::new();
         while let Some(component) = components.next() {
-            match self.0[cursor_idx].children.get(component).copied() {
+            match self.child(cursor_idx, component) {
                 None => {
                     debug_assert!(!must_exist, "didn't find '{location}' for removal");
                     // The remaining components cannot belong to this path once a prefix is absent.
@@ -631,7 +713,7 @@ impl TreeNodes {
                     ancestry.push((cursor_idx, component.to_owned(), existing_idx));
                     let is_last = components.peek().is_none();
                     if is_last {
-                        let node = &mut self.0[existing_idx];
+                        let node = &mut self.nodes[existing_idx];
                         debug_assert!(!must_exist || node.change_idx.is_some(), "no change at '{location}'");
                         node.change_idx = None;
                         node.change_is_tree = false;
@@ -643,11 +725,11 @@ impl TreeNodes {
         }
 
         while let Some((parent_idx, component, child_idx)) = ancestry.pop() {
-            let child = &self.0[child_idx];
-            if child.change_idx.is_some() || !child.children.is_empty() {
+            let child = &self.nodes[child_idx];
+            if child.change_idx.is_some() || !child.is_leaf_node() {
                 break;
             }
-            self.0[parent_idx].children.remove(component.as_bstr());
+            self.remove_child(parent_idx, component.as_bstr());
         }
     }
 
@@ -657,22 +739,16 @@ impl TreeNodes {
     /// destination. Its source is already represented by the original change tree; only the
     /// rescheduled destination must become visible now.
     pub fn insert(&mut self, new_change: &Change, new_change_idx: usize) {
-        let mut next_index = self.0.len();
-        let mut cursor = &mut self.0[0];
+        let mut cursor_idx = 0;
         for component in to_components(new_change.location()) {
-            match cursor.children.get(component).copied() {
-                None => {
-                    cursor.children.insert(component.to_owned(), next_index);
-                    self.0.push(TreeNode::default());
-                    cursor = &mut self.0[next_index];
-                    next_index += 1;
-                }
-                Some(existing_idx) => {
-                    cursor = &mut self.0[existing_idx];
-                }
+            let (child_idx, is_new) = self.child_or_insert(cursor_idx, component);
+            if is_new {
+                self.nodes.push(TreeNode::default());
             }
+            cursor_idx = child_idx;
         }
 
+        let cursor = &mut self.nodes[cursor_idx];
         cursor.change_idx = Some(new_change_idx);
         cursor.change_is_tree = new_change.entry_mode().is_tree();
         cursor.location = ChangeLocation::CurrentLocation;
@@ -751,11 +827,15 @@ mod tree_nodes_tests {
     #[test]
     fn removing_an_absent_nested_change_does_not_remove_a_matching_root_suffix() {
         let mut tree = TreeNodes::new();
-        tree.0[0].children.insert("b".into(), 1);
-        tree.0.push(TreeNode {
-            change_idx: Some(42),
-            ..Default::default()
-        });
+        tree.track_change(
+            &Change::Addition {
+                location: "b".into(),
+                relation: None,
+                entry_mode: EntryKind::Blob.into(),
+                id: gix_hash::Kind::Sha1.null(),
+            },
+            42,
+        );
 
         tree.remove_change("a/b".into());
         assert!(
