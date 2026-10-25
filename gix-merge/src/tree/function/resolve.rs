@@ -23,7 +23,7 @@ use crate::tree::{
     },
 };
 
-use super::change::{MatchKind, collect as collect_changes, matching as matching_change, pair as pair_candidate};
+use super::change::{MatchKind, collect_both as collect_changes, matching as matching_change, pair as pair_candidate};
 
 /// Perform a merge between `our_tree` and `their_tree`, using `base_tree` as merge-base.
 /// Note that `base_tree` can be an empty tree to indicate 'no common ancestor between the two sides'.
@@ -107,31 +107,21 @@ pub fn tree<'objects>(
     options: Options,
 ) -> Result<Outcome<'objects>> {
     let _span = gix_trace::coarse!("gix_merge::tree", ?base_tree, ?our_tree, ?their_tree, ?labels);
-    let (mut base_buf, mut side_buf) = (Vec::new(), Vec::new());
+    let mut base_buf = Vec::new();
     let mut editor = {
         let ancestor_tree = objects.find_tree(base_tree, &mut base_buf)?;
         tree::Editor::new(ancestor_tree.to_owned(), objects, base_tree.kind())
     };
     let resolve_tree_conflicts = options.tree_conflicts;
 
-    let mut ours = collect_changes(
+    let (mut ours, mut theirs) = collect_changes(
         base_tree,
         our_tree,
-        &base_buf,
-        &mut side_buf,
-        objects,
-        diff_resource_cache,
-        diff_state,
-        options.rewrites,
-    )?;
-    let mut theirs = collect_changes(
-        base_tree,
         their_tree,
-        &base_buf,
-        &mut side_buf,
+        &mut base_buf,
+        diff_state,
         objects,
         diff_resource_cache,
-        diff_state,
         options.rewrites,
     )?;
     let mut conflicts = Vec::new();

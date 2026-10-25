@@ -8,11 +8,12 @@
 //! Semantic conflict resolution and edits to the result tree belong to the
 //! sibling `resolve` module; this module only prepares, indexes, and matches work.
 
-use bstr::{BString, ByteSlice};
-use gix_diff::{tree::recorder::Location, tree_with_rewrites::Change};
+use bstr::{BString, ByteSlice, ByteVec};
+use gix_diff::tree_with_rewrites::Change;
 use gix_error::ResultExt;
 use gix_error::{Result, message};
-use gix_object::FindExt;
+use gix_object::{FindExt, TreeRefIter, tree::EntryRef};
+use std::collections::VecDeque;
 
 use crate::tree::utils::{ChangeList, ChangeListRef, PossibleConflict, TreeNodes, track};
 
@@ -84,46 +85,381 @@ pub(super) enum MatchKind {
     EraseLeaf,
 }
 
-/// Collect one side's changes relative to the base and build their path index.
+/// Collect both sides relative to the same base in one breadth-first tree walk.
 ///
-/// `base_buf` contains `base_tree`, while `side_buf` is reused to load `side_tree`.
-/// Equal tree IDs produce an empty state without diffing. Otherwise, the path-aware
-/// diff, including the requested rewrite tracking, is normalized through [`track`]
-/// into a [`ChangeList`] and indexed by [`TreeNodes`] in the returned [`SideState`].
+/// Tree entries from the base are decoded once per visited directory and compared with
+/// both sides before descending. Each side's resulting changes are then passed through
+/// the same rewrite tracker and normalization as an independent tree diff.
 #[expect(clippy::too_many_arguments)]
-pub(super) fn collect(
+pub(super) fn collect_both(
     base_tree: &gix_hash::oid,
-    side_tree: &gix_hash::oid,
-    base_buf: &[u8],
-    side_buf: &mut Vec<u8>,
+    our_tree: &gix_hash::oid,
+    their_tree: &gix_hash::oid,
+    base_buf: &mut Vec<u8>,
+    diff_state: &mut gix_diff::tree::State,
     objects: &impl gix_object::FindObjectOrHeader,
     diff_resource_cache: &mut gix_diff::blob::Platform,
-    diff_state: &mut gix_diff::tree::State,
     rewrites: Option<gix_diff::Rewrites>,
-) -> Result<SideState> {
+) -> Result<(SideState, SideState)> {
+    let (mut our_raw, mut their_raw) = (Vec::new(), Vec::new());
+    if base_tree != our_tree || base_tree != their_tree {
+        let mut queue = VecDeque::from([Walk {
+            base: Some(base_tree.to_owned()),
+            ours: Some(our_tree.to_owned()),
+            theirs: Some(their_tree.to_owned()),
+            ours_relation: None,
+            theirs_relation: None,
+            path: Default::default(),
+            is_root: true,
+        }]);
+        let (mut our_change_id, mut their_change_id) = (0, 0);
+        while let Some(walk) = queue.pop_front() {
+            if walk.base == walk.ours && walk.base == walk.theirs {
+                continue;
+            }
+            let base_entries = match walk.base.as_ref() {
+                Some(id) if walk.is_root => TreeRefIter::from_bytes(base_buf, id.kind())
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .or_raise(|| message("Tree merge failed"))?,
+                Some(id) => read_entries(id, base_buf, objects)?,
+                None => Vec::new(),
+            };
+            let our_entries = match walk.ours.as_ref() {
+                Some(id) if walk.base.as_ref() == Some(id) => base_entries.clone(),
+                Some(id) => read_entries(id, &mut diff_state.buf1, objects)?,
+                None => Vec::new(),
+            };
+            let their_entries = match walk.theirs.as_ref() {
+                Some(id) if walk.base.as_ref() == Some(id) => base_entries.clone(),
+                Some(id) => read_entries(id, &mut diff_state.buf2, objects)?,
+                None => Vec::new(),
+            };
+            let (mut base_idx, mut our_idx, mut their_idx) = (0, 0, 0);
+            while base_idx < base_entries.len() || our_idx < our_entries.len() || their_idx < their_entries.len() {
+                let next = [
+                    base_entries.get(base_idx),
+                    our_entries.get(our_idx),
+                    their_entries.get(their_idx),
+                ]
+                .into_iter()
+                .flatten()
+                .min_by(|a, b| a.cmp(b))
+                .copied()
+                .expect("at least one tree entry remains");
+                let base = take_equal(&base_entries, &mut base_idx, next);
+                let ours = take_equal(&our_entries, &mut our_idx, next);
+                let theirs = take_equal(&their_entries, &mut their_idx, next);
+
+                let mut location = walk.path.clone();
+                if !location.is_empty() {
+                    location.push(b'/');
+                }
+                location.push_str(next.filename);
+                let ours_child_relation = record_pair(
+                    base,
+                    ours,
+                    walk.ours_relation,
+                    &location,
+                    &mut our_change_id,
+                    &mut our_raw,
+                );
+                let theirs_child_relation = record_pair(
+                    base,
+                    theirs,
+                    walk.theirs_relation,
+                    &location,
+                    &mut their_change_id,
+                    &mut their_raw,
+                );
+                let base_child = base
+                    .filter(|entry| entry.mode.is_tree())
+                    .map(|entry| entry.oid.to_owned());
+                let ours_child = ours
+                    .filter(|entry| entry.mode.is_tree())
+                    .map(|entry| entry.oid.to_owned());
+                let theirs_child = theirs
+                    .filter(|entry| entry.mode.is_tree())
+                    .map(|entry| entry.oid.to_owned());
+                if base_child.is_some() || ours_child.is_some() || theirs_child.is_some() {
+                    queue.push_back(Walk {
+                        base: base_child,
+                        ours: ours_child,
+                        theirs: theirs_child,
+                        ours_relation: ours_child_relation,
+                        theirs_relation: theirs_child_relation,
+                        path: location,
+                        is_root: false,
+                    });
+                }
+            }
+        }
+    }
+
+    let source_tree = if rewrites.is_some_and(|r| {
+        r.copies
+            .is_some_and(|c| c.source == gix_diff::rewrites::CopySource::FromSetOfModifiedFilesAndAllSources)
+    }) {
+        Some(source_tree_changes(base_tree, objects)?)
+    } else {
+        None
+    };
+    let ours = finish_changes(our_raw, rewrites, source_tree.as_deref(), diff_resource_cache, objects)?;
+    let theirs = finish_changes(
+        their_raw,
+        rewrites,
+        source_tree.as_deref(),
+        diff_resource_cache,
+        objects,
+    )?;
+    Ok((SideState::from_changes(ours), SideState::from_changes(theirs)))
+}
+
+struct Walk {
+    base: Option<gix_hash::ObjectId>,
+    ours: Option<gix_hash::ObjectId>,
+    theirs: Option<gix_hash::ObjectId>,
+    ours_relation: Option<gix_diff::tree::visit::Relation>,
+    theirs_relation: Option<gix_diff::tree::visit::Relation>,
+    path: BString,
+    is_root: bool,
+}
+
+fn read_entries<'a>(
+    tree_id: &gix_hash::oid,
+    buf: &'a mut Vec<u8>,
+    objects: &impl gix_object::FindObjectOrHeader,
+) -> Result<Vec<EntryRef<'a>>> {
+    let mut entries = Vec::new();
+    for entry in objects
+        .find_tree_iter(tree_id, buf)
+        .or_raise(|| message("Tree merge failed"))?
+    {
+        entries.push(entry.or_raise(|| message("Tree merge failed"))?);
+    }
+    Ok(entries)
+}
+
+fn take_equal<'a>(entries: &'a [EntryRef<'a>], index: &mut usize, next: EntryRef<'a>) -> Option<EntryRef<'a>> {
+    entries.get(*index).copied().filter(|entry| {
+        if entry.cmp(&next).is_eq() {
+            *index += 1;
+            true
+        } else {
+            false
+        }
+    })
+}
+
+fn record_pair(
+    base: Option<EntryRef<'_>>,
+    side: Option<EntryRef<'_>>,
+    relation: Option<gix_diff::tree::visit::Relation>,
+    location: &bstr::BString,
+    change_id: &mut u32,
+    changes: &mut Vec<(gix_diff::tree::visit::Change, BString)>,
+) -> Option<gix_diff::tree::visit::Relation> {
+    use gix_diff::tree::visit::{Change, Relation};
+    let mut child_relation = relation;
+    let change = match (base, side) {
+        (Some(base), Some(side)) if base.mode.is_tree() && side.mode.is_tree() => {
+            (base.oid != side.oid).then(|| Change::Modification {
+                previous_entry_mode: base.mode,
+                previous_oid: base.oid.to_owned(),
+                entry_mode: side.mode,
+                oid: side.oid.to_owned(),
+            })
+        }
+        (Some(base), Some(side)) => (base.oid != side.oid || base.mode != side.mode).then(|| Change::Modification {
+            previous_entry_mode: base.mode,
+            previous_oid: base.oid.to_owned(),
+            entry_mode: side.mode,
+            oid: side.oid.to_owned(),
+        }),
+        (Some(base), None) => {
+            if base.mode.is_tree() {
+                child_relation = Some(relation.unwrap_or_else(|| {
+                    *change_id += 1;
+                    Relation::Parent(*change_id)
+                }));
+            }
+            Some(Change::Deletion {
+                entry_mode: base.mode,
+                oid: base.oid.to_owned(),
+                relation: if base.mode.is_tree() { child_relation } else { relation },
+            })
+        }
+        (None, Some(side)) => {
+            if side.mode.is_tree() {
+                child_relation = Some(relation.unwrap_or_else(|| {
+                    *change_id += 1;
+                    Relation::Parent(*change_id)
+                }));
+            }
+            Some(Change::Addition {
+                entry_mode: side.mode,
+                oid: side.oid.to_owned(),
+                relation: if side.mode.is_tree() { child_relation } else { relation },
+            })
+        }
+        (None, None) => None,
+    };
+    if let Some(change) = change {
+        changes.push((change, location.to_owned()));
+    }
+    child_relation.map(|relation| match relation {
+        Relation::Parent(id) => Relation::ChildOfParent(id),
+        Relation::ChildOfParent(id) => Relation::ChildOfParent(id),
+    })
+}
+
+fn finish_changes(
+    raw: Vec<(gix_diff::tree::visit::Change, BString)>,
+    rewrites: Option<gix_diff::Rewrites>,
+    source_tree: Option<&[(gix_diff::tree::visit::Change, BString)]>,
+    diff_resource_cache: &mut gix_diff::blob::Platform,
+    objects: &impl gix_object::FindObjectOrHeader,
+) -> Result<ChangeList> {
+    use gix_diff::rewrites::tracker::Change as _;
+    use gix_diff::tree_with_rewrites::ChangeRef;
     let mut changes = Vec::new();
-    if base_tree != side_tree {
-        let side_tree = objects
-            .find_tree_iter(side_tree, side_buf)
-            .or_raise(|| message("Tree merge failed"))?;
-        gix_diff::tree_with_rewrites(
-            gix_object::TreeRefIter::from_bytes(base_buf, base_tree.kind()),
-            side_tree,
-            diff_resource_cache,
-            diff_state,
-            objects,
-            |change| {
+    let Some(rewrites) = rewrites else {
+        for (change, location) in raw {
+            track(raw_change_ref(&change, location.as_bstr()), &mut changes);
+        }
+        return Ok(changes);
+    };
+
+    let mut tracker = gix_diff::rewrites::Tracker::new(rewrites);
+    for (change, location) in raw {
+        if let Some(change) = tracker.try_push_change(change, location.as_bstr()) {
+            track(raw_change_ref(&change, location.as_bstr()), &mut changes);
+        }
+    }
+    tracker
+        .emit(
+            |dest, source| {
+                let (id, entry_mode) = gix_diff::rewrites::tracker::Change::id_and_entry_mode(&dest.change);
+                let change = if let Some(source) = source {
+                    ChangeRef::Rewrite {
+                        source_location: source.location,
+                        source_entry_mode: source.entry_mode,
+                        source_id: source.id,
+                        source_relation: source.change.relation(),
+                        entry_mode,
+                        id: id.to_owned(),
+                        relation: dest.change.relation(),
+                        diff: source.diff,
+                        location: dest.location,
+                        copy: source.kind == gix_diff::rewrites::tracker::visit::SourceKind::Copy,
+                    }
+                } else {
+                    raw_change_ref(&dest.change, dest.location)
+                };
                 track(change, &mut changes);
-                Ok(std::ops::ControlFlow::Continue(()))
+                std::ops::ControlFlow::Continue(())
             },
-            gix_diff::tree_with_rewrites::Options {
-                location: Some(Location::Path),
-                rewrites,
+            diff_resource_cache,
+            objects,
+            |push| {
+                if let Some(source_tree) = source_tree {
+                    for (change, location) in source_tree {
+                        push(change.clone(), location.as_bstr());
+                    }
+                }
+                Ok::<_, gix_error::Error>(())
             },
         )
         .or_raise(|| message("Tree merge failed"))?;
+    Ok(changes)
+}
+
+fn raw_change_ref<'a>(
+    change: &'a gix_diff::tree::visit::Change,
+    location: &'a bstr::BStr,
+) -> gix_diff::tree_with_rewrites::ChangeRef<'a> {
+    use gix_diff::tree::visit::Change::*;
+    match change {
+        Addition {
+            entry_mode,
+            oid,
+            relation,
+        } => gix_diff::tree_with_rewrites::ChangeRef::Addition {
+            location,
+            entry_mode: *entry_mode,
+            relation: *relation,
+            id: *oid,
+        },
+        Deletion {
+            entry_mode,
+            oid,
+            relation,
+        } => gix_diff::tree_with_rewrites::ChangeRef::Deletion {
+            location,
+            entry_mode: *entry_mode,
+            relation: *relation,
+            id: *oid,
+        },
+        Modification {
+            previous_entry_mode,
+            previous_oid,
+            entry_mode,
+            oid,
+        } => gix_diff::tree_with_rewrites::ChangeRef::Modification {
+            location,
+            previous_entry_mode: *previous_entry_mode,
+            previous_id: *previous_oid,
+            entry_mode: *entry_mode,
+            id: *oid,
+        },
     }
-    Ok(SideState::from_changes(changes))
+}
+
+fn source_tree_changes(
+    base_tree: &gix_hash::oid,
+    objects: &impl gix_object::FindObjectOrHeader,
+) -> Result<Vec<(gix_diff::tree::visit::Change, BString)>> {
+    fn visit(
+        tree_id: &gix_hash::oid,
+        path: &mut BString,
+        objects: &impl gix_object::FindObjectOrHeader,
+        out: &mut Vec<(gix_diff::tree::visit::Change, BString)>,
+    ) -> Result<()> {
+        let entries = {
+            let mut buf = Vec::new();
+            objects
+                .find_tree_iter(tree_id, &mut buf)
+                .or_raise(|| message("Tree merge failed"))?
+                .map(|entry| entry.map(|entry| (entry.mode, entry.filename.to_owned(), entry.oid.to_owned())))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .or_raise(|| message("Tree merge failed"))?
+        };
+        for (mode, filename, oid) in entries {
+            let old_len = path.len();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.push_str(&filename);
+            if mode.is_tree() {
+                visit(&oid, path, objects, out)?;
+            } else if mode.is_blob() {
+                out.push((
+                    gix_diff::tree::visit::Change::Modification {
+                        previous_entry_mode: mode,
+                        previous_oid: gix_hash::ObjectId::null(oid.kind()),
+                        entry_mode: mode,
+                        oid,
+                    },
+                    path.clone(),
+                ));
+            }
+            path.truncate(old_len);
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
+    visit(base_tree, &mut BString::default(), objects, &mut out)?;
+    Ok(out)
 }
 
 /// Find an eligible change on our indexed side that structurally interacts with `theirs`.
