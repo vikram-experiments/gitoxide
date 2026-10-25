@@ -1,7 +1,5 @@
 use gix_error::Result;
-use std::io::Write;
-
-use gix_error::{ErrorExt, ResultExt, bail, message};
+use gix_error::{ResultExt, bail, message};
 use gix_hash::ObjectId;
 
 use crate::{data, data::output, find};
@@ -139,24 +137,57 @@ impl output::Entry {
         obj: &gix_object::Data<'_>,
         compression: gix_zlib::Compression,
     ) -> Result<Self> {
+        let mut compressor = gix_zlib::stream::deflate::Compress::new(compression);
+        let mut output_buffer = [0; 4096 * 8];
+        Self::from_data_with_compressor(count, obj, &mut compressor, &mut output_buffer)
+    }
+
+    pub(crate) fn from_data_with_compressor(
+        count: &output::Count,
+        obj: &gix_object::Data<'_>,
+        compressor: &mut gix_zlib::stream::deflate::Compress,
+        output_buffer: &mut [u8],
+    ) -> Result<Self> {
+        use gix_zlib::stream::deflate::FlushCompress;
+
+        let mut compressed_data = Vec::new();
+        let mut remaining = obj.data;
+        while !remaining.is_empty() {
+            let previous_total_in = compressor.total_in();
+            let previous_total_out = compressor.total_out();
+            compressor
+                .compress(remaining, output_buffer, FlushCompress::None)
+                .or_raise(|| message("Failed to compress pack entry"))?;
+            let consumed = (compressor.total_in() - previous_total_in) as usize;
+            let written = (compressor.total_out() - previous_total_out) as usize;
+            remaining = &remaining[consumed..];
+            compressed_data.extend_from_slice(&output_buffer[..written]);
+            if consumed == 0 && written == 0 {
+                bail!(message("Failed to compress pack entry"));
+            }
+        }
+
+        loop {
+            let previous_total_out = compressor.total_out();
+            let status = compressor
+                .compress(&[], output_buffer, FlushCompress::Finish)
+                .or_raise(|| message("Failed to finish compressing pack entry"))?;
+            let written = (compressor.total_out() - previous_total_out) as usize;
+            compressed_data.extend_from_slice(&output_buffer[..written]);
+            if status == gix_zlib::Status::StreamEnd {
+                break;
+            }
+            if written == 0 {
+                bail!(message("Failed to finish compressing pack entry"));
+            }
+        }
+        compressor.reset();
+
         Ok(output::Entry {
             id: count.id.to_owned(),
             kind: Kind::Base(obj.kind),
             decompressed_size: obj.data.len(),
-            compressed_data: {
-                let mut out = gix_zlib::stream::deflate::Write::new(Vec::new(), compression);
-                if let Err(err) = std::io::copy(&mut &*obj.data, &mut out) {
-                    match err.kind() {
-                        std::io::ErrorKind::Other => {
-                            bail!(err.and_raise(message("Failed to compress pack entry")));
-                        }
-                        err => unreachable!("Should never see other errors than zlib, but got {:?}", err),
-                    }
-                }
-                out.flush()
-                    .or_raise(|| message("Failed to finish compressing pack entry"))?;
-                out.into_inner()
-            },
+            compressed_data,
         })
     }
 
