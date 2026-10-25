@@ -12,6 +12,7 @@ pub(crate) mod function {
 
     use super::{Mode, Options, Outcome, ProgressId, reduce, util};
     use crate::data::output;
+    use crate::data::output::entry::Deflater;
 
     /// Given a known list of object `counts`, calculate entries ready to be put into a data pack.
     ///
@@ -147,6 +148,7 @@ pub(crate) mod function {
                 move |n| {
                     (
                         Vec::new(), // object data buffer
+                        Deflater::new(compression),
                         progress
                             .lock()
                             .add_child_with_id(format!("thread {n}"), gix_utils::progress::UNKNOWN),
@@ -155,7 +157,7 @@ pub(crate) mod function {
             },
             {
                 let counts = Arc::clone(&counts);
-                move |(chunk_id, chunk_range): (SequenceId, std::ops::Range<usize>), (buf, progress)| {
+                move |(chunk_id, chunk_range): (SequenceId, std::ops::Range<usize>), (buf, deflater, progress)| {
                     let mut out = Vec::new();
                     let chunk = &counts[chunk_range];
                     let mut stats = Outcome::default();
@@ -220,7 +222,7 @@ pub(crate) mod function {
                                         {
                                             Some((obj, _location)) => {
                                                 stats.decoded_and_recompressed_objects += 1;
-                                                output::Entry::from_data(count, &obj, compression)
+                                                output::Entry::from_data_with_deflater(count, &obj, deflater)
                                             }
                                             None => {
                                                 stats.missing_objects += 1;
@@ -236,7 +238,7 @@ pub(crate) mod function {
                             {
                                 Some((obj, _location)) => {
                                     stats.decoded_and_recompressed_objects += 1;
-                                    output::Entry::from_data(count, &obj, compression)
+                                    output::Entry::from_data_with_deflater(count, &obj, deflater)
                                 }
                                 None => {
                                     stats.missing_objects += 1;
