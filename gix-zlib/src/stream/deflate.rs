@@ -162,6 +162,14 @@ mod impls {
             self.inner
         }
 
+        /// Take the inner writer, replacing it with its default value.
+        pub fn take_inner(&mut self) -> W
+        where
+            W: Default,
+        {
+            std::mem::take(&mut self.inner)
+        }
+
         fn write_inner(&mut self, mut buf: &[u8], flush: FlushCompress) -> io::Result<usize> {
             let total_in_when_start = self.compressor.total_in();
             loop {

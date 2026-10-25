@@ -139,13 +139,21 @@ impl output::Entry {
         obj: &gix_object::Data<'_>,
         compression: gix_zlib::Compression,
     ) -> Result<Self> {
+        let mut out = gix_zlib::stream::deflate::Write::new(Vec::new(), compression);
+        Self::from_data_with_writer(count, obj, &mut out)
+    }
+
+    pub(crate) fn from_data_with_writer(
+        count: &output::Count,
+        obj: &gix_object::Data<'_>,
+        out: &mut gix_zlib::stream::deflate::Write<Vec<u8>>,
+    ) -> Result<Self> {
         Ok(output::Entry {
             id: count.id.to_owned(),
             kind: Kind::Base(obj.kind),
             decompressed_size: obj.data.len(),
             compressed_data: {
-                let mut out = gix_zlib::stream::deflate::Write::new(Vec::new(), compression);
-                if let Err(err) = std::io::copy(&mut &*obj.data, &mut out) {
+                if let Err(err) = std::io::copy(&mut &*obj.data, &mut *out) {
                     match err.kind() {
                         std::io::ErrorKind::Other => {
                             bail!(err.and_raise(message("Failed to compress pack entry")));
@@ -155,7 +163,9 @@ impl output::Entry {
                 }
                 out.flush()
                     .or_raise(|| message("Failed to finish compressing pack entry"))?;
-                out.into_inner()
+                let compressed_data = out.take_inner();
+                out.reset();
+                compressed_data
             },
         })
     }
