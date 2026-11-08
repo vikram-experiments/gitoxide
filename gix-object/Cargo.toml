@@ -70,7 +70,7 @@ gix-hash = { path = "../gix-hash", features = ["bstr"] }
 gix-testtools = { path = "../tests/tools", default-features = false }
 gix-odb = { path = "../gix-odb" }
 termtree = "1.0.0"
-criterion = "0.8.2"
+criterion = { version = "6.0.0", package = "codspeed-criterion-compat" }
 pretty_assertions = "1.0.0"
 insta = "1.46.3"
 

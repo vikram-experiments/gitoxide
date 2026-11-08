@@ -67,7 +67,7 @@ rustix = { version = "1.1.2", default-features = false, features = [
 libc = { version = "0.2.186" }
 
 [dev-dependencies]
-criterion = "0.8.2"
+criterion = { version = "6.0.0", package = "codspeed-criterion-compat" }
 gix-testtools = { path = "../tests/tools", default-features = false, features = ["sha1", "sha256"] }
 gix-hash = { path = "../gix-hash", features = ["sha1", "sha256"] }
 gix-hashtable = { path = "../gix-hashtable" }

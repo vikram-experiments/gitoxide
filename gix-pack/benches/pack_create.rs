@@ -9,7 +9,7 @@
 //! and we use in-memory speeds for this.
 use std::{io, sync::atomic::AtomicBool};
 
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use gix_object::Write as _;
 use gix_pack::{
     data::output::{self, bytes::FromEntriesIter, count, entry},
@@ -79,6 +79,8 @@ fn write_pack(odb: &Memory, counts: Vec<output::Count>) -> u64 {
             Box::new(progress::Discard),
             entry::iter_from_counts::Options {
                 mode: entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
+                // CodSpeed's CPU simulation measures a single thread, so stay deterministic there.
+                thread_limit: std::env::var_os("CODSPEED_ENV").map(|_| 1),
                 ..Default::default()
             },
         )
@@ -129,8 +131,4 @@ fn bench_write(c: &mut Criterion) {
 }
 
 criterion_group!(benches, bench_count, bench_write);
-
-fn main() {
-    benches();
-    Criterion::default().configure_from_args().final_summary();
-}
+criterion_main!(benches);
