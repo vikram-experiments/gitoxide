@@ -28,8 +28,10 @@ jobs:
       fail-fast: false
       matrix:
         shard:
-          - name: pack-and-blame
-            packages: -p gix-pack -p gix-blame
+          - name: pack
+            packages: -p gix-pack
+          - name: blame
+            packages: -p gix-blame
           - name: diff-and-merge
             packages: -p gix-diff -p gix-merge -p gix-note
           - name: core

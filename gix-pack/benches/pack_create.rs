@@ -22,6 +22,21 @@ use gix_utils::progress;
 /// the phases scale; raise locally to probe larger, more degenerate repositories.
 const OBJECT_COUNTS: &[usize] = &[1_000, 10_000, 50_000];
 
+/// Whether the benchmark runs under CodSpeed, whose CPU simulation is single-threaded and much slower
+/// than native execution.
+fn under_codspeed() -> bool {
+    std::env::var_os("CODSPEED_ENV").is_some()
+}
+
+/// The object counts to exercise, skipping the largest one under CodSpeed to keep CI runs reasonably short.
+fn object_counts() -> &'static [usize] {
+    if under_codspeed() {
+        &OBJECT_COUNTS[..OBJECT_COUNTS.len() - 1]
+    } else {
+        OBJECT_COUNTS
+    }
+}
+
 /// Create a fresh in-memory object database populated with `count` unique blobs.
 fn memory_odb(count: usize) -> (Memory, Vec<gix_hash::ObjectId>) {
     let mut odb = gix_odb::memory::Proxy::new(gix_odb::sink(gix_hash::Kind::Sha1), gix_hash::Kind::Sha1);
@@ -80,7 +95,7 @@ fn write_pack(odb: &Memory, counts: Vec<output::Count>) -> u64 {
             entry::iter_from_counts::Options {
                 mode: entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
                 // CodSpeed's CPU simulation measures a single thread, so stay deterministic there.
-                thread_limit: std::env::var_os("CODSPEED_ENV").map(|_| 1),
+                thread_limit: under_codspeed().then_some(1),
                 ..Default::default()
             },
         )
@@ -102,7 +117,7 @@ fn write_pack(odb: &Memory, counts: Vec<output::Count>) -> u64 {
 
 fn bench_count(c: &mut Criterion) {
     let mut group = c.benchmark_group("count-in-memory-objects");
-    for &n in OBJECT_COUNTS {
+    for &n in object_counts() {
         let (odb, object_ids) = memory_odb(n);
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
@@ -114,7 +129,7 @@ fn bench_count(c: &mut Criterion) {
 
 fn bench_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("write-pack");
-    for &n in OBJECT_COUNTS {
+    for &n in object_counts() {
         let (odb, object_ids) = memory_odb(n);
         let counts = count_objects_unthreaded(&odb, &object_ids);
         let pack_size = write_pack(&odb, counts.clone());
