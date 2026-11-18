@@ -139,24 +139,41 @@ impl output::Entry {
         obj: &gix_object::Data<'_>,
         compression: gix_zlib::Compression,
     ) -> Result<Self> {
+        Self::from_data_with(
+            count,
+            obj,
+            &mut gix_zlib::stream::deflate::Write::new(Vec::new(), compression),
+        )
+    }
+
+    /// Like [`from_data()`](Self::from_data), but reuses `out`, which must be a fresh or reset deflate stream
+    /// writing to an empty `Vec`. It is reset and emptied again before returning.
+    pub(crate) fn from_data_with(
+        count: &output::Count,
+        obj: &gix_object::Data<'_>,
+        out: &mut gix_zlib::stream::deflate::Write<Vec<u8>>,
+    ) -> Result<Self> {
+        let res = (|| -> Result<()> {
+            if let Err(err) = std::io::copy(&mut &*obj.data, out) {
+                match err.kind() {
+                    std::io::ErrorKind::Other => {
+                        bail!(err.and_raise(message("Failed to compress pack entry")));
+                    }
+                    err => unreachable!("Should never see other errors than zlib, but got {:?}", err),
+                }
+            }
+            out.flush()
+                .or_raise(|| message("Failed to finish compressing pack entry"))?;
+            Ok(())
+        })();
+        let compressed_data = std::mem::take(out.get_mut());
+        out.reset();
+        res?;
         Ok(output::Entry {
             id: count.id.to_owned(),
             kind: Kind::Base(obj.kind),
             decompressed_size: obj.data.len(),
-            compressed_data: {
-                let mut out = gix_zlib::stream::deflate::Write::new(Vec::new(), compression);
-                if let Err(err) = std::io::copy(&mut &*obj.data, &mut out) {
-                    match err.kind() {
-                        std::io::ErrorKind::Other => {
-                            bail!(err.and_raise(message("Failed to compress pack entry")));
-                        }
-                        err => unreachable!("Should never see other errors than zlib, but got {:?}", err),
-                    }
-                }
-                out.flush()
-                    .or_raise(|| message("Failed to finish compressing pack entry"))?;
-                out.into_inner()
-            },
+            compressed_data,
         })
     }
 
