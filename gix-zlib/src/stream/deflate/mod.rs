@@ -161,6 +161,11 @@ mod impls {
             self.backend.reset();
         }
 
+        /// Return a mutable reference to the inner writer.
+        pub fn get_mut(&mut self) -> &mut W {
+            &mut self.inner
+        }
+
         /// Consume `self` and return the inner writer.
         pub fn into_inner(self) -> W {
             self.inner
